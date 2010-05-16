@@ -3,7 +3,7 @@ use warnings FATAL => 'all';
 
 package Test::TempDatabase;
 
-our $VERSION = 0.15;
+our $VERSION = 0.16;
 use DBI;
 use DBD::Pg;
 use POSIX qw(setuid);
@@ -38,8 +38,10 @@ when Test::TempDatabase instance goes out of scope.
 sub connect {
 	my ($self, $db_name) = @_;
 	my $cp = $self->connect_params;
+	$db_name ||= $cp->{dbname};
+	my $h = $cp->{cluster_dir} ? "host=$cp->{cluster_dir};" : "";
 	my $dbi_args = $cp->{dbi_args} || { RaiseError => 1, AutoCommit => 1 };
-	return DBI->connect("dbi:Pg:dbname=$db_name;" . ($cp->{rest} || ''),
+	return DBI->connect("dbi:Pg:dbname=$db_name;$h" . ($cp->{rest} || ''),
 				$cp->{username}, $cp->{password}, $dbi_args);
 }
 
@@ -69,6 +71,32 @@ sub become_postgres_user {
 	$ENV{HOME} = $pw[ $#pw - 1 ];
 }
 
+sub create_db {
+	my $self = shift;
+	my $cp = $self->connect_params;
+	my $dbh = $self->connect('template1');
+
+	my $found = @{ $dbh->selectcol_arrayref(
+			"select datname from pg_database where "
+			. "datname = '$cp->{dbname}'") };
+
+	my $drop_it = (!$cp->{no_drop} && $found);
+	$self->drop_db if $drop_it;
+
+	my $tn = $cp->{template} ? "template \"$cp->{template}\"" : "";
+	$dbh->do("create database \"$cp->{dbname}\" $tn")
+		if ($drop_it || !$found);
+	$dbh->disconnect;
+	$dbh = $self->connect($cp->{dbname});
+	$self->{db_handle} = $dbh;
+
+	if (my $schema = $cp->{schema}) {
+		my $vs = $schema->new($dbh);
+		$vs->run_updates;
+		$self->{schema} = $vs;
+	}
+}
+
 =head2 create
 
 Creates temporary database. It will be dropped when the resulting
@@ -88,26 +116,7 @@ sub create {
 	my ($class, %args) = @_;
 	my $self = $class->new(\%args);
 	$self->become_postgres_user;
-
-	my $dbh = $self->connect('template1');
-
-	my $arr = $dbh->selectcol_arrayref(
-			"select datname from pg_database where "
-			. "datname = '" . $args{dbname} . "'");
-	$dbh->do("drop database \"$args{dbname}\"")
-		if (!$args{no_drop} && @$arr);
-
-	$self->try_really_hard($dbh, "create database \"$args{dbname}\"")
-		unless (@$arr && $args{no_drop});
-	$dbh->disconnect;
-	$dbh = $self->connect($args{dbname});
-	$self->{db_handle} = $dbh;
-
-	if (my $schema = $args{schema}) {
-		my $vs = $schema->new($dbh);
-		$vs->run_updates;
-		$self->{schema} = $vs;
-	}
+	$self->create_db;
 	return $self;
 }
 
@@ -118,24 +127,27 @@ sub new {
 	return $self;
 }
 
+sub _call_pg_cmd {
+	my ($self, $cmd) = @_;
+	my ($bdir) = (`pg_config | grep BINDIR` =~ /= (\S+)$/);
+	$cmd = "$bdir/$cmd";
+	$cmd = "su - postgres -c '$cmd'" unless $<;
+	my $res = `$cmd 2>&1`;
+	confess $res if $?;
+}
+
 sub create_cluster {
 	my $self = shift;
-	my $pg_conf = `pg_config | grep BINDIR`;
-	my ($bdir) = ($pg_conf =~ /= (\S+)$/);
-	die "No binary dir found: $pg_conf\n" unless $bdir;
 	my $cdir = $self->{connect_params}->{cluster_dir};
-	my $res = `$bdir/initdb -D $cdir 2>&1`;
-	die $res if $?;
-
+	$self->_call_pg_cmd("initdb -D $cdir");
 	append_file("$cdir/postgresql.conf"
 		, "\nlisten_addresses = ''\nunix_socket_directory = '$cdir'\n");
 }
 
 sub start_server {
 	my $self = shift;
-	my ($bdir) = (`pg_config | grep BINDIR` =~ /= (\S+)$/);
 	my $cdir = $self->{connect_params}->{cluster_dir};
-	system("$bdir/pg_ctl -D $cdir -l $cdir/log start") and die;
+	$self->_call_pg_cmd("pg_ctl -D $cdir -l $cdir/log start");
 
 	sleep 1;
 	for (1 .. 5) {
@@ -148,28 +160,26 @@ sub start_server {
 
 sub stop_server {
 	my $self = shift;
-	my ($bdir) = (`pg_config | grep BINDIR` =~ /= (\S+)$/);
 	my $cdir = $self->{connect_params}->{cluster_dir};
-	system("$bdir/pg_ctl -D $cdir -l $cdir/log stop") and die;
+	$self->_call_pg_cmd("pg_ctl -D $cdir -m fast -l $cdir/log stop");
 }
 
 sub connect_params { return shift()->{connect_params}; }
 sub handle { return shift()->{db_handle}; }
 
-sub try_really_hard {
-	my ($self, $dbh, $cmd) = @_;
-	$dbh->do("set client_min_messages to fatal");
-	local $dbh->{PrintError};
-	local $dbh->{PrintWarn};
-	local $dbh->{RaiseError};
-	local $dbh->{HandleError};
-	my $res;
-	for (my $i = 0; $i < 5; $i++) {
-		$res = $dbh->do($cmd) and last;
-		sleep 1;
+sub drop_db {
+	my $self = shift;
+	my $dn = $self->connect_params->{dbname};
+	my @plines = `ps auxx | grep post | grep $dn | grep -v grep`;
+	my $dbh = $self->connect('template1');
+	for (@plines) {
+		/\w\s+(\d+)/ or next;
+		$dbh->do("select pg_terminate_backend($1)");
 	}
-	printf STDERR "# Fatal failure %s doing $cmd\n", $dbh->errstr
-		unless $res;
+	$dbh->do(q{ set client_min_messages to warning });
+	$dbh->do("drop database if exists \"$dn\"");
+	$dbh->disconnect;
+	$self->{db_handle} = undef;
 }
 
 sub destroy {
@@ -179,15 +189,20 @@ sub destroy {
 	$self->{db_handle} = undef;
 	return unless $self->{pid} == $$;
 	return if $self->connect_params->{no_drop};
-	my $dn = $self->connect_params->{dbname};
-	my $dbh = $self->connect('template1');
-	$self->try_really_hard($dbh, "drop database \"$dn\"");
-	$dbh->disconnect;
+	$self->drop_db;
 }
 
 sub DESTROY {
 	my $self = shift;
 	$self->destroy if $self->handle;
+}
+
+sub dump_db {
+	my ($self, $file) = @_;
+	my $cp = $self->connect_params;
+	my $h = $cp->{cluster_dir} ? "-h $cp->{cluster_dir}" : "";
+	my $cmd = "pg_dump $h -O -c $cp->{dbname} > $file";
+	system($cmd) and confess "Unable to do $cmd";
 }
 
 =head1 BUGS
